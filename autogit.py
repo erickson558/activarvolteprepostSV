@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Git Helper GUI – v0.1.7
-- Auto-sync en rechazo non-fast-forward/fetch first:
-  * pull --rebase --autostash
-  * si historias no relacionadas: pull --allow-unrelated-histories --no-edit
-  * fallback con estrategia -X ours para conservar local.
-- Se mantienen: consolas ocultas, creación repo (gh), autodetectar carpeta .exe y repo,
-  commit inicial único, reintentos de push, limpieza GH001, status bar + countdown,
-  guardado de GUI en config_autogit.json.
+Git Helper GUI – v0.1.8
+- Consolas ocultas: todos los subprocesos Git/GH se ejecutan sin mostrar ventanas.
+- Auto-sync en rechazo non-fast-forward/fetch first (pull con rebase/autostash, fallback con
+  --allow-unrelated-histories y estrategia -X ours).
+- Creación automática del repo remoto (gh) si no existe.
+- Autodetecta carpeta del .exe como ruta del proyecto y nombre del repo.
+- Manejo de archivos grandes (GH001): ignora, untrack y limpia historial (filter-repo o filter-branch).
+- .gitignore y untrack de config/log/exe.
+- Status bar con countdown, guardado de config en config_autogit.json.
 """
 
 import os, sys, json, hashlib, threading, datetime, queue, traceback, subprocess, time
@@ -448,9 +449,13 @@ class App(tk.Tk):
     def _startupinfo_flags(self):
         si = None; cf = 0
         if os.name == "nt":
-            si = subprocess.STARTUPINFO(); si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            try: cf = subprocess.CREATE_NO_WINDOW
-            except AttributeError: cf = 0
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = 0  # SW_HIDE
+            try:
+                cf = subprocess.CREATE_NO_WINDOW
+            except AttributeError:
+                cf = 0
         return si, cf
 
     def _git_env(self, project_path):
@@ -459,6 +464,15 @@ class App(tk.Tk):
         env["GIT_WORK_TREE"] = project_path
         env["GIT_DIR"] = os.path.join(project_path, ".git")
         env["GIT_CEILING_DIRECTORIES"] = os.path.dirname(project_path)
+
+        # Evitar consolas por paginadores/editores/prompts
+        env["GIT_PAGER"] = "cat"
+        env["PAGER"] = "cat"
+        env["GH_PAGER"] = "cat"
+        env["GIT_TERMINAL_PROMPT"] = "0"  # no abrir prompt para credenciales
+        env["GCM_INTERACTIVE"] = "Never"  # Git Credential Manager sin UI
+        env["NO_COLOR"] = "1"
+
         return env
 
     def _exe_exists(self, name):
@@ -523,9 +537,11 @@ class App(tk.Tk):
     def _is_git_repo(self, path):
         si, cf = self._startupinfo_flags()
         try:
-            rc = subprocess.call(["git","rev-parse","--is-inside-work-tree"], cwd=path,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 startupinfo=si, creationflags=cf, env=self._git_env(path))
+            rc = subprocess.call(
+                ["git","rev-parse","--is-inside-work-tree"], cwd=path,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                startupinfo=si, creationflags=cf, env=self._git_env(path)
+            )
             return rc == 0
         except Exception: return False
 
@@ -692,10 +708,17 @@ class App(tk.Tk):
 
     def _worktree_dirty(self, cwd):
         try:
-            rc1 = subprocess.call(["git","diff","--cached","--quiet"], cwd=cwd,
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=self._git_env(cwd))
-            rc2 = subprocess.call(["git","diff","--quiet"], cwd=cwd,
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=self._git_env(cwd))
+            si, cf = self._startupinfo_flags()
+            rc1 = subprocess.call(
+                ["git","diff","--cached","--quiet"], cwd=cwd,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=self._git_env(cwd), startupinfo=si, creationflags=cf
+            )
+            rc2 = subprocess.call(
+                ["git","diff","--quiet"], cwd=cwd,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=self._git_env(cwd), startupinfo=si, creationflags=cf
+            )
             rc3_out = self._run_check_output(["git","ls-files","--others","--exclude-standard"], cwd=cwd)
             has_untracked = bool((rc3_out or "").strip())
             return (rc1 != 0) or (rc2 != 0) or has_untracked
@@ -835,7 +858,6 @@ class App(tk.Tk):
                 "fetch first", "non-fast-forward", "updates were rejected", "failed to push some refs"
             ]):
                 if self._sync_with_remote(project_path):
-                    # reintentar push
                     rc2, _ = self._run_cmd_capture(["git","push","-u",origin,branch], project_path)
                     if rc2 == 0: return 0
                     else: self.worker_queue.put(("log", "Push aún rechazado tras sincronizar."))
@@ -981,12 +1003,15 @@ class App(tk.Tk):
                     self.worker_queue.put(("log","ERROR en git add .")); self.worker_queue.put(("done",None)); return
 
             # ¿Hay algo staged?
+            si, cf = self._startupinfo_flags()
             rc_diff_cached = subprocess.call(
                 ["git","diff","--cached","--quiet"],
                 cwd=project_path,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                env=self._git_env(project_path)
+                env=self._git_env(project_path),
+                startupinfo=si,
+                creationflags=cf
             )
 
             if first_time:
