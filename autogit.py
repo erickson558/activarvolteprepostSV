@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Git Helper GUI – v0.1.6
-- FIX commit inicial: un solo commit en primera ejecución; posteriores solo si hay cambios.
-- Autodetecta carpeta del ejecutable como project_path y repo_name (simula “Autodetectar” al abrir).
-- Crea repo remoto (gh) si no existe; configura origin y hace push.
-- Consolas ocultas; status bar con countdown; logs UTF-8; guardado automático de GUI en config_autogit.json.
-- Manejo de GH001 (>100MB): ignora/untrack en working tree, purga historial (filter-repo o filter-branch con stash), force-push.
-- Evita pathspec not matched al untrackear; silencia avisos LF↔CRLF con core.safecrlf=false.
+Git Helper GUI – v0.1.7
+- Auto-sync en rechazo non-fast-forward/fetch first:
+  * pull --rebase --autostash
+  * si historias no relacionadas: pull --allow-unrelated-histories --no-edit
+  * fallback con estrategia -X ours para conservar local.
+- Se mantienen: consolas ocultas, creación repo (gh), autodetectar carpeta .exe y repo,
+  commit inicial único, reintentos de push, limpieza GH001, status bar + countdown,
+  guardado de GUI en config_autogit.json.
 """
 
 import os, sys, json, hashlib, threading, datetime, queue, traceback, subprocess, time
@@ -74,9 +75,9 @@ DEFAULT_CONFIG = {
     "shortcuts_enabled": True,
 
     # Proyecto / repo
-    "project_path": app_dir(),             # carpeta del ejecutable
+    "project_path": app_dir(),
     "repo_name": "",
-    "follow_exe_folder": True,             # fuerza usar la carpeta del .exe/.py
+    "follow_exe_folder": True,  # usar siempre la carpeta donde está el .exe/.py
 
     # Git identity
     "git_user_name": "erickson558",
@@ -153,7 +154,7 @@ class App(tk.Tk):
 
         self._build_style(); self._build_menu(); self._build_widgets()
 
-        # Forzar usar SIEMPRE la carpeta del ejecutable como project_path (si follow_exe_folder=True)
+        # Forzar usar SIEMPRE la carpeta del ejecutable como project_path
         if self.cfg.get("follow_exe_folder", True):
             exe_dir = app_dir()
             self.project_path_var.set(exe_dir)
@@ -786,7 +787,41 @@ class App(tk.Tk):
             self.worker_queue.put(("log", "ERROR: no se pudo limpiar la historia."))
         return ok
 
-    # --- Push con reintentos + detección GH001 ---
+    # --- Auto-sync con remoto cuando push es rechazado ---
+    def _sync_with_remote(self, project_path):
+        self.worker_queue.put(("log", "Intentando sincronizar con remoto (fetch/pull)…"))
+        # Siempre aseguramos upstream
+        self._run_cmd(["git","fetch","origin","main"], cwd=project_path)
+        self._run_cmd(["git","branch","--set-upstream-to=origin/main","main"], cwd=project_path)
+
+        # 1) pull rebase con autostash
+        rc = self._run_cmd(["git","pull","--rebase","--autostash","origin","main"], cwd=project_path)
+        if rc == 0:
+            self.worker_queue.put(("log", "pull --rebase exitoso."))
+            return True
+
+        # 2) historias no relacionadas
+        self._run_cmd(["git","rebase","--abort"], cwd=project_path)  # por si quedó a medias
+        rc = self._run_cmd(["git","pull","origin","main","--allow-unrelated-histories","--no-edit"], cwd=project_path)
+        if rc == 0:
+            self.worker_queue.put(("log", "pull con --allow-unrelated-histories exitoso."))
+            return True
+
+        # 3) estrategia que conserva local (ours)
+        self._run_cmd(["git","merge","--abort"], cwd=project_path)   # por si quedó a medias
+        rc = self._run_cmd(["git","pull","-s","recursive","-X","ours","origin","main",
+                            "--allow-unrelated-histories","--no-edit"], cwd=project_path)
+        if rc == 0:
+            self.worker_queue.put(("log", "pull con estrategia -X ours exitoso (se conserva local)."))
+            return True
+
+        # Si nada funcionó, abortar y reportar
+        self._run_cmd(["git","merge","--abort"], cwd=project_path)
+        self._run_cmd(["git","rebase","--abort"], cwd=project_path)
+        self.worker_queue.put(("log", "No se pudo sincronizar automáticamente con el remoto."))
+        return False
+
+    # --- Push con reintentos + detección GH001 + non-fast-forward ---
     def _git_push_with_retries(self, project_path, origin="origin", branch="main"):
         attempts = 3
         for i in range(1, attempts+1):
@@ -794,6 +829,16 @@ class App(tk.Tk):
             if rc == 0: return 0
             text = (out or "").lower()
             self.worker_queue.put(("log", f"push intento {i}/{attempts} falló (rc={rc})"))
+
+            # Rechazo por non-fast-forward / fetch first
+            if any(s in text for s in [
+                "fetch first", "non-fast-forward", "updates were rejected", "failed to push some refs"
+            ]):
+                if self._sync_with_remote(project_path):
+                    # reintentar push
+                    rc2, _ = self._run_cmd_capture(["git","push","-u",origin,branch], project_path)
+                    if rc2 == 0: return 0
+                    else: self.worker_queue.put(("log", "Push aún rechazado tras sincronizar."))
 
             # GH001 / Large files
             if any(s in text for s in ["large files detected", "exceeds github's file size limit", "lfs", "gh001"]):
@@ -862,10 +907,10 @@ class App(tk.Tk):
             first_time = not self._is_git_repo(project_path)
 
             if first_time:
-                # 1) init primero (para que exista .git)
+                # 1) init para crear .git
                 if self._run_cmd(["git","init"], cwd=project_path) != 0:
                     self.worker_queue.put(("log","ERROR en git init")); self.worker_queue.put(("done",None)); return
-                # 2) config LOCAL (ya hay .git)
+                # 2) config LOCAL
                 identity_steps = [
                     (["git","config","user.name", git_name], "git config user.name"),
                     (["git","config","user.email", git_mail], "git config user.email"),
@@ -945,7 +990,6 @@ class App(tk.Tk):
             )
 
             if first_time:
-                # Solo un commit en la primera vez
                 commit_msg_use = (self.commit_message_var.get().strip() or "Primer commit")
                 args = ["git","commit","-m", commit_msg_use] if rc_diff_cached != 0 else ["git","commit","-m", commit_msg_use, "--allow-empty"]
                 if self._run_cmd(args, cwd=project_path) != 0:
@@ -959,7 +1003,7 @@ class App(tk.Tk):
                 else:
                     self.worker_queue.put(("log","No hay cambios para commitear."))
 
-            # push (con reintentos + limpieza GH001)
+            # push (con reintentos + limpieza GH001 + auto-sync si es necesario)
             rc = self._git_push_with_retries(project_path, "origin", "main")
             if rc != 0:
                 self.worker_queue.put(("log","ERROR en push. Revisa remoto/credenciales.")); self.worker_queue.put(("done",None)); return
